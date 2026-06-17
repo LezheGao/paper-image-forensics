@@ -60,19 +60,19 @@ results/
 
 ```json
 {
-  "total\_subfigures": 42,
-  "global\_duplicates": \[\["sub1.png", "sub2.png", 1]],
-  "local\_duplicates": {
-    "sub3.png": \[\[\[x1,y1], \[x2,y2], ...], ...]
+  "total_subfigures": 42,
+  "global_duplicates": [["sub1.png", "sub2.png", 1]],
+  "local_duplicates": {
+    "sub3.png": [[[x1,y1], [x2,y2], ...], ...]
   },
-  "ela\_noise": {
+  "ela_noise": {
     "sub4.png": {
       "ela": {"75": 0.0, "90": 0.0, "98": 1.2},
-      "noise\_inconsistency": 62.4
+      "noise_inconsistency": 62.4
     }
   },
-  "copy\_move\_vectors": {
-    "sub5.png": \[\[-120.5, 80.3]]
+  "copy_move_vectors": {
+    "sub5.png": [[-120.5, 80.3]]
   }
 }
 ```
