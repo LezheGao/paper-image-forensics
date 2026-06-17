@@ -45,7 +45,7 @@ python forensics.py --input paper.pdf --output results/
 |--min\_area\_ratio|0.02|子图最小面积占原图比例（过滤噪声轮廓）|
 |--border\_margin|10|子图轮廓向外扩展的像素数|
 |--noise\_threshold|50|噪声方差不一致性基础阈值|
-|`--workers`|1|并行处理子图的进程数（建议设为 CPU 核心数）|
+|--workers|1|并行处理子图的进程数（建议设为 CPU 核心数）|
 
 ## 输出结构
 
