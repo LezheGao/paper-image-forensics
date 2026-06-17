@@ -2,19 +2,20 @@
 # -*- coding: utf-8 -*-
 """
 学术论文图像取证工具
-- 自适应子图拆解：优先利用 PDF DCI 信息，回退视觉分割
+- 子图拆解：基于OTSU+轮廓检测的视觉分割
 - 局部重复检测：动态面积比、紧凑度、边缘过滤
 - 复制‑移动检测：SIFT + 运动支持度 GMS + RANSAC 验证
-- ELA 分析：背景噪声基线校正，突出局部异常
+- ELA 分析：背景噪声基线校正，内存操作
 - 噪声分析：积分图加速 + 动态阈值
-- 精确标注：原图坐标映射，生成对比图
-- 批量加速：多进程处理子图分析（可选）
+- 精确标注：原图坐标映射，生成对比图，自适应箭头
+- 批量加速：多进程处理子图分析（参数开放）
 """
 
 import os
+import sys
 import json
 import base64
-import tempfile
+import traceback
 from io import BytesIO
 from collections import defaultdict
 from concurrent.futures import ProcessPoolExecutor, as_completed
@@ -27,48 +28,52 @@ import cv2
 import numpy as np
 from sklearn.cluster import DBSCAN
 
-# ---------- 0. 辅助 ----------
-def compute_phash(img_path, hash_size=8):
+# ---------- 全局常量（可调参数） ----------
+DEFAULT_HASH_SIZE = 8
+DEFAULT_OTSU_BLOCK = 5          # 形态学闭运算核大小
+DEFAULT_ELA_DIFF_THRESHOLD = 30
+DEFAULT_NOISE_WIN_SIZE = 15
+DEFAULT_RANSAC_THRESH = 5.0
+DEFAULT_GMS_RADIUS = 30
+DEFAULT_GMS_ANGLE_THRESH = 15
+DEFAULT_GMS_SCALE_THRESH = 0.5
+DEFAULT_MIN_SUPPORT = 3
+DEFAULT_CM_MIN_MATCH = 15
+DEFAULT_CM_EPS = 2
+DEFAULT_CM_MIN_SAMPLES = 5
+
+# ---------- 辅助函数 ----------
+def compute_phash(img_path, hash_size=DEFAULT_HASH_SIZE):
     try:
         return imagehash.phash(Image.open(img_path), hash_size=hash_size)
     except Exception:
         return None
 
-# ---------- 1. 图像提取（含 DCI 支持） ----------
-def extract_images_from_pdf(pdf_path, output_dir, use_dci=True, dpi=200):
-    """
-    从 PDF 提取图像，若 use_dci=True 则同时返回每张图像的页面放置矩形。
-    返回 (img_count, dci_map): dci_map 为 {img_path: [fitz.Rect, ...]}（按页面坐标）。
-    """
+def safe_imread(img_path, flags=cv2.IMREAD_COLOR):
+    """安全读取图像，失败返回 None 并打印错误"""
+    img = cv2.imread(img_path, flags)
+    if img is None:
+        print(f"警告: 无法读取图像 {img_path}", file=sys.stderr)
+    return img
+
+# ---------- 1. 图像提取（仅提取，无DCI） ----------
+def extract_images_from_pdf(pdf_path, output_dir):
+    """从PDF提取所有嵌入图像，返回图像数量"""
     doc = fitz.open(pdf_path)
     img_count = 0
-    dci_map = {}
     for page_num in range(len(doc)):
         page = doc[page_num]
-        # 获取所有图像引用及它们的位置
-        if use_dci:
-            image_info = page.get_image_info()
-            # image_info: [{'xref':..., 'width':..., 'height':..., 'bbox': (x0,y0,x1,y1), ...}, ...]
-            # 为避免重复提取相同 xref，先处理
-            xref_rects = defaultdict(list)
-            for info in image_info:
-                xref = info['xref']
-                xref_rects[xref].append(fitz.Rect(info['bbox']))
-        # 使用 get_images 提取嵌入图像
         images = page.get_images(full=True)
         for img_index, img in enumerate(images):
             xref = img[0]
             pix = fitz.Pixmap(doc, xref)
-            # 修正色彩空间判断：若像素格式不是 RGB 则转换为 RGB
             if pix.colorspace is not None and pix.colorspace.n != 3:
                 pix = fitz.Pixmap(fitz.csRGB, pix)
             img_path = os.path.join(output_dir, f"page{page_num+1}_img{img_index+1}.png")
             pix.save(img_path)
             img_count += 1
-            if use_dci and xref in xref_rects:
-                dci_map[img_path] = xref_rects[xref]
     doc.close()
-    return img_count, dci_map
+    return img_count
 
 def extract_images_from_xml(xml_path, output_dir):
     tree = ET.parse(xml_path)
@@ -93,18 +98,23 @@ def extract_images_from_xml(xml_path, output_dir):
             img_path = os.path.join(output_dir, f"xml_img_{img_count+1}.png")
             img.save(img_path)
             img_count += 1
-    return img_count, {}
+    return img_count
 
-# ---------- 2. 子图拆解（DCI 优先 / 视觉分割回退） ----------
-def extract_subfigures_visual(img_path, output_dir, min_area_ratio=0.02, border_margin=10):
-    img = cv2.imread(img_path)
+# ---------- 2. 子图拆解（纯视觉分割） ----------
+def extract_subfigures(img_path, output_dir, min_area_ratio=0.02, border_margin=10,
+                       otsu_block_size=5, morph_iter=2):
+    """
+    使用OTSU二值化 + 轮廓检测拆解组合大图。
+    返回列表，每个元素为 (子图路径, (x,y,w,h)) 在原图中的坐标。
+    """
+    img = safe_imread(img_path)
     if img is None:
         return []
     h, w = img.shape[:2]
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
     _, thresh = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
-    kernel = np.ones((5,5), np.uint8)
-    closed = cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, kernel, iterations=2)
+    kernel = np.ones((otsu_block_size, otsu_block_size), np.uint8)
+    closed = cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, kernel, iterations=morph_iter)
     contours, _ = cv2.findContours(closed, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     min_area = max(5000, int(w * h * min_area_ratio))
     subfigures = []
@@ -131,41 +141,6 @@ def extract_subfigures_visual(img_path, output_dir, min_area_ratio=0.02, border_
         subfigures.append((out_path, (0, 0, w, h)))
     return subfigures
 
-def extract_subfigures_dci(img_path, dci_rects, output_dir):
-    """
-    根据 DCI 提供的页面矩形，映射到提取图像的像素坐标并裁剪。
-    dci_rects: fitz.Rect 列表，表示图像在 PDF 页面上的位置（单位：点）。
-    注意：这里假设 pixmap 提取的图像与原始图像尺寸相同，且 DCI 矩形是对应图像在页面上的完整放置。
-    通过计算页面缩放比例转换坐标（简化处理：假设图像没有旋转）。
-    """
-    img = cv2.imread(img_path)
-    if img is None:
-        return []
-    h_img, w_img = img.shape[:2]
-    # 假设提取图像恰好是原始图像，且 DCI 矩形覆盖整个图像（通常如此）。
-    # 但实际上有时图像会缩放，我们直接按整个图像裁剪为每个 DCI 矩形对应的子区域。
-    # 这里简便处理：以图像本身为参考，假设 DCI 矩形是相对于图像原始尺寸的（可能需要缩放）。
-    # 更鲁棒的做法：使用 PDF 页面尺寸和图像像素尺寸估算比例，但暂时省略。
-    # 我们采用：如果 dci_rects 数量 >= 1 且面积覆盖超过 90% 图像，则视为单子图（不拆解）。
-    # 否则，按矩形比例位置裁剪。
-    subfigures = []
-    # 计算 DCI 矩形的并集面积占图像面积的比例
-    if not dci_rects:
-        return extract_subfigures_visual(img_path, output_dir)  # 回退
-    # 将 Rect 转换为像素坐标（假设图像宽度对应页面宽度？这里需要页面尺寸，暂无）
-    # 简化：假设 DCI 矩形已经和提取图像等比例，直接使用 rect 的相对位置裁剪
-    # 获取页面尺寸：需要从外部传入，但暂时跳过。
-    # 因为当前无法获取页面尺寸，我们暂不做 DCI 裁剪，保留原视觉方法。
-    # 注：真正的 DCI 集成需要页面渲染或页面尺寸信息，此处仅作占位。
-    return extract_subfigures_visual(img_path, output_dir)  # 暂时回退，待完善
-
-def extract_subfigures(img_path, output_dir, dci_rects=None, **kwargs):
-    """统一入口：优先尝试 DCI，否则视觉分割。"""
-    if dci_rects:
-        # 暂未完全实现 DCI 像素映射，回退视觉
-        return extract_subfigures_visual(img_path, output_dir, **kwargs)
-    return extract_subfigures_visual(img_path, output_dir, **kwargs)
-
 # ---------- 3. 全局重复检测 ----------
 def find_global_duplicates_subfigs(subfig_paths, threshold=2):
     hash_dict = {}
@@ -182,14 +157,12 @@ def find_global_duplicates_subfigs(subfig_paths, threshold=2):
                 duplicates.append((os.path.basename(keys[i]), os.path.basename(keys[j]), dist))
     return duplicates
 
-# ---------- 4. 局部重复检测（动态过滤） ----------
-def find_local_duplicates_strict(img_path, block_size=64, hash_size=8, eps=0.2, min_samples=3):
-    """
-    修正：DBSCAN 的 eps 参数采用归一化汉明距离阈值，典型值 0.2 左右。
-    参数 hash_size=8 时，哈希向量长度为 8*8=64，汉明距离转换为 [0,1] 后，0.2 对应约 12-13 位差异。
-    """
+# ---------- 4. 局部重复检测 ----------
+def find_local_duplicates_strict(img_path, block_size=64, hash_size=DEFAULT_HASH_SIZE,
+                                 eps=0.2, min_samples=3, dynamic_area_max=0.15,
+                                 edge_ratio_thresh=0.7, std_thresh=15):
     try:
-        img = cv2.imread(img_path)
+        img = safe_imread(img_path)
         if img is None:
             return []
         h, w = img.shape[:2]
@@ -199,7 +172,7 @@ def find_local_duplicates_strict(img_path, block_size=64, hash_size=8, eps=0.2, 
             for x in range(0, w - block_size + 1, block_size):
                 block = img[y:y+block_size, x:x+block_size]
                 gray_block = cv2.cvtColor(block, cv2.COLOR_BGR2GRAY)
-                if np.std(gray_block) < 15:
+                if np.std(gray_block) < std_thresh:
                     continue
                 block_pil = Image.fromarray(cv2.cvtColor(block, cv2.COLOR_BGR2RGB))
                 ph = imagehash.phash(block_pil, hash_size=hash_size)
@@ -207,11 +180,10 @@ def find_local_duplicates_strict(img_path, block_size=64, hash_size=8, eps=0.2, 
                 hashes.append(ph)
         if len(hashes) < 2:
             return []
-        # 将哈希对象转为 0/1 矩阵并展平为 float 向量，用于汉明距离的 DBSCAN
         hash_vectors = np.array([np.array(h, dtype=np.float64).flatten() for h in hashes])
         clustering = DBSCAN(eps=eps, min_samples=min_samples, metric='hamming').fit(hash_vectors)
         labels = clustering.labels_
-        dynamic_max_area_ratio = max(0.03, min(0.15, 20000.0 / (w * h)))
+        dynamic_max_area_ratio = max(0.03, min(dynamic_area_max, 20000.0 / (w * h)))
         suspicious_groups = []
         for label in set(labels):
             if label == -1:
@@ -230,20 +202,28 @@ def find_local_duplicates_strict(img_path, block_size=64, hash_size=8, eps=0.2, 
             edge_count = sum(1 for x, y in group_coords if
                              x < edge_margin or x > w - edge_margin or
                              y < edge_margin or y > h - edge_margin)
-            if edge_count / len(group_coords) > 0.7:
+            if edge_count / len(group_coords) > edge_ratio_thresh:
                 continue
             suspicious_groups.append(group_coords)
         return suspicious_groups
     except Exception as e:
-        print(f"局部检测失败 {img_path}: {e}")
+        print(f"局部检测失败 {img_path}: {e}\n{traceback.format_exc()}", file=sys.stderr)
         return []
 
-# ---------- 5. 复制-移动检测 (GMS + RANSAC) ----------
-def detect_copy_move_gms(img_path, min_match=15, eps=2, min_samples=5,
-                         gms_radius=30, gms_angle_thresh=15, gms_scale_thresh=0.5,
-                         min_support=3, ransac_thresh=5.0):
+# ---------- 5. 复制-移动检测 ----------
+def detect_copy_move_gms(img_path,
+                         min_match=DEFAULT_CM_MIN_MATCH,
+                         eps=DEFAULT_CM_EPS,
+                         min_samples=DEFAULT_CM_MIN_SAMPLES,
+                         gms_radius=DEFAULT_GMS_RADIUS,
+                         gms_angle_thresh=DEFAULT_GMS_ANGLE_THRESH,
+                         gms_scale_thresh=DEFAULT_GMS_SCALE_THRESH,
+                         min_support=DEFAULT_MIN_SUPPORT,
+                         ransac_thresh=DEFAULT_RANSAC_THRESH,
+                         min_displacement=10,
+                         max_area_ratio=0.3):
     try:
-        img = cv2.imread(img_path)
+        img = safe_imread(img_path)
         if img is None:
             return []
         gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
@@ -260,7 +240,7 @@ def detect_copy_move_gms(img_path, min_match=15, eps=2, min_samples=5,
         pts_train = np.array([kp[m.trainIdx].pt for m in matches], dtype=np.float32)
         displacements = pts_train - pts_query
         dists = np.linalg.norm(displacements, axis=1)
-        valid = dists >= 10
+        valid = dists >= min_displacement
         matches = [m for m, v in zip(matches, valid) if v]
         pts_query = pts_query[valid]
         pts_train = pts_train[valid]
@@ -287,12 +267,12 @@ def detect_copy_move_gms(img_path, min_match=15, eps=2, min_samples=5,
         if np.sum(good_idx) < min_match:
             return []
         displacements_good = displacements[good_idx]
-        # 位移聚类
         X = displacements_good
         clustering = DBSCAN(eps=eps, min_samples=min_samples).fit(X)
         labels = clustering.labels_
         suspicious_vectors = []
         good_matches_indices = np.where(good_idx)[0]
+        img_area = gray.shape[0] * gray.shape[1]
         for label in set(labels):
             if label == -1:
                 continue
@@ -302,13 +282,11 @@ def detect_copy_move_gms(img_path, min_match=15, eps=2, min_samples=5,
             orig_indices = good_matches_indices[idxs_in_good]
             pts_q = pts_query[orig_indices]
             pts_t = pts_train[orig_indices]
-            # 凸包面积过滤
             hull_q = cv2.convexHull(pts_q.astype(np.float32))
             hull_t = cv2.convexHull(pts_t.astype(np.float32))
             area_q = cv2.contourArea(hull_q)
             area_t = cv2.contourArea(hull_t)
-            img_area = gray.shape[0] * gray.shape[1]
-            if area_q > 0.3 * img_area or area_t > 0.3 * img_area:
+            if area_q > max_area_ratio * img_area or area_t > max_area_ratio * img_area:
                 continue
             # RANSAC 单应性验证
             if len(pts_q) >= 4:
@@ -316,32 +294,31 @@ def detect_copy_move_gms(img_path, min_match=15, eps=2, min_samples=5,
                 if mask is not None:
                     inlier_ratio = np.sum(mask) / len(mask)
                     if inlier_ratio < 0.5:
-                        continue  # 剔除内点不足的簇
+                        continue
             mean_vec = np.mean(X[idxs_in_good], axis=0)
             suspicious_vectors.append(tuple(mean_vec))
         return suspicious_vectors
     except Exception as e:
-        print(f"复制-移动检测失败 {img_path}: {e}")
+        print(f"复制-移动检测失败 {img_path}: {e}\n{traceback.format_exc()}", file=sys.stderr)
         return []
 
-# ---------- 6. ELA + 噪声分析（背景校正） ----------
+# ---------- 6. ELA + 噪声分析 ----------
 def ela_and_noise_analysis(img_path, quality_list=[75, 90, 98], diff_threshold=30,
-                           noise_std_threshold=50, ela_bg_correction=True):
+                           noise_std_threshold=50, ela_bg_correction=True,
+                           noise_win_size=DEFAULT_NOISE_WIN_SIZE):
     results = {"ela": {}, "noise_inconsistency": 0.0}
     try:
-        img = cv2.imread(img_path)
+        img = safe_imread(img_path)
         if img is None:
             return results
-        # ELA 带背景校正
+        # ELA 使用内存编解码
         for q in quality_list:
-            temp_path = f"temp_ela_{q}_{os.getpid()}.jpg"
-            cv2.imwrite(temp_path, img, [int(cv2.IMWRITE_JPEG_QUALITY), q])
-            ela_img = cv2.imread(temp_path)
+            _, enc = cv2.imencode('.jpg', img, [int(cv2.IMWRITE_JPEG_QUALITY), q])
+            ela_img = cv2.imdecode(enc, cv2.IMREAD_COLOR)
             diff = cv2.absdiff(img, ela_img)
             diff_gray = cv2.cvtColor(diff, cv2.COLOR_BGR2GRAY)
             diff_equalized = cv2.equalizeHist(diff_gray)
             if ela_bg_correction:
-                # 使用全局中位数 + 3 倍标准差作为动态阈值
                 global_median = np.median(diff_equalized)
                 global_std = np.std(diff_equalized)
                 dynamic_thresh = global_median + 3 * global_std
@@ -349,12 +326,11 @@ def ela_and_noise_analysis(img_path, quality_list=[75, 90, 98], diff_threshold=3
             else:
                 _, high_diff = cv2.threshold(diff_equalized, diff_threshold, 255, cv2.THRESH_BINARY)
             abnormal_ratio = np.sum(high_diff > 0) / diff_equalized.size * 100
-            results["ela"][q] = round(abnormal_ratio, 2) if abnormal_ratio > 1.0 else 0.0  # 放宽极低比例
-            os.remove(temp_path)
-        # 噪声方差（boxFilter 加速）
+            results["ela"][q] = round(abnormal_ratio, 2) if abnormal_ratio > 1.0 else 0.0
+        # 噪声方差
         gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
         lap = cv2.Laplacian(gray, cv2.CV_64F)
-        win_size = 15
+        win_size = noise_win_size
         mean_lap = cv2.boxFilter(lap, -1, (win_size, win_size), normalize=True)
         mean_lap2 = cv2.boxFilter(lap**2, -1, (win_size, win_size), normalize=True)
         var_map = mean_lap2 - mean_lap**2
@@ -364,10 +340,10 @@ def ela_and_noise_analysis(img_path, quality_list=[75, 90, 98], diff_threshold=3
         results["noise_inconsistency"] = round(var_std, 2) if var_std > adaptive_thresh else 0.0
         return results
     except Exception as e:
-        print(f"ELA/噪声分析失败 {img_path}: {e}")
+        print(f"ELA/噪声分析失败 {img_path}: {e}\n{traceback.format_exc()}", file=sys.stderr)
         return results
 
-# ---------- 7. 并排对比图生成 ----------
+# ---------- 7. 可视化标注 ----------
 def create_comparison(orig_path, annotated_path, output_path, labels=('原图','标注')):
     try:
         orig = Image.open(orig_path)
@@ -386,28 +362,27 @@ def create_comparison(orig_path, annotated_path, output_path, labels=('原图','
         draw.text((w + 20, 10), labels[1], fill='black', font=font)
         canvas.save(output_path)
     except Exception as e:
-        print(f"生成对比图失败: {e}")
+        print(f"生成对比图失败: {e}\n{traceback.format_exc()}", file=sys.stderr)
 
 def draw_annotations_on_original(orig_path, annotations, output_path):
-    """
-    修正：正确处理箭头标注，期望的格式为 ('arrow', ((sx, sy), (ex, ey)), color)
-    """
-    img = cv2.imread(orig_path)
+    """标注格式：('rect', (x,y,w,h), color) 或 ('arrow', ((sx,sy),(ex,ey)), color)"""
+    img = safe_imread(orig_path)
     if img is None:
         return
+    h_img, w_img = img.shape[:2]
     img_pil = Image.fromarray(cv2.cvtColor(img, cv2.COLOR_BGR2RGB))
     draw = ImageDraw.Draw(img_pil)
+    arrow_len = max(10, int(min(w_img, h_img) * 0.02))
     for ann in annotations:
         if ann[0] == 'rect':
             x, y, w, h = ann[1]
             color = ann[2] if len(ann) > 2 else 'red'
             draw.rectangle([x, y, x+w, y+h], outline=color, width=3)
         elif ann[0] == 'arrow':
-            start, end = ann[1]  # 现在正确解包为两个二元组
+            start, end = ann[1]
             color = ann[2] if len(ann) > 2 else 'blue'
             draw.line([start, end], fill=color, width=3)
             angle = np.arctan2(end[1]-start[1], end[0]-start[0])
-            arrow_len = 15
             for sign in [-1, 1]:
                 tip_x = end[0] + arrow_len * np.cos(angle + sign * np.pi/6)
                 tip_y = end[1] + arrow_len * np.sin(angle + sign * np.pi/6)
@@ -415,12 +390,27 @@ def draw_annotations_on_original(orig_path, annotations, output_path):
     img_pil.save(output_path)
 
 # ---------- 8. 单子图处理（用于多进程） ----------
-def process_single_subfig(sub_path, block_size, ela_qualities, noise_std_threshold):
-    """处理单个子图，返回各项结果字典"""
-    local = find_local_duplicates_strict(sub_path, block_size=block_size)
-    en = ela_and_noise_analysis(sub_path, quality_list=ela_qualities,
-                                noise_std_threshold=noise_std_threshold)
-    cm = detect_copy_move_gms(sub_path)
+def process_single_subfig(sub_path, block_size, ela_qualities, noise_std_threshold,
+                          local_eps, local_min_samples, cm_params):
+    local = find_local_duplicates_strict(
+        sub_path, block_size=block_size,
+        eps=local_eps, min_samples=local_min_samples
+    )
+    en = ela_and_noise_analysis(
+        sub_path, quality_list=ela_qualities,
+        noise_std_threshold=noise_std_threshold
+    )
+    cm = detect_copy_move_gms(
+        sub_path,
+        min_match=cm_params.get('min_match', DEFAULT_CM_MIN_MATCH),
+        eps=cm_params.get('eps', DEFAULT_CM_EPS),
+        min_samples=cm_params.get('min_samples', DEFAULT_CM_MIN_SAMPLES),
+        gms_radius=cm_params.get('gms_radius', DEFAULT_GMS_RADIUS),
+        gms_angle_thresh=cm_params.get('gms_angle_thresh', DEFAULT_GMS_ANGLE_THRESH),
+        gms_scale_thresh=cm_params.get('gms_scale_thresh', DEFAULT_GMS_SCALE_THRESH),
+        min_support=cm_params.get('min_support', DEFAULT_MIN_SUPPORT),
+        ransac_thresh=cm_params.get('ransac_thresh', DEFAULT_RANSAC_THRESH)
+    )
     return {
         'path': sub_path,
         'local': local,
@@ -431,7 +421,11 @@ def process_single_subfig(sub_path, block_size, ela_qualities, noise_std_thresho
 # ---------- 9. 主流程 ----------
 def scan_paper(input_path, output_dir, threshold=2, block_size=64,
                ela_qualities=[75,90,98], min_area_ratio=0.02, border_margin=10,
-               noise_std_threshold=50, use_dci=False, workers=1):
+               noise_std_threshold=50, workers=1,
+               local_eps=0.2, local_min_samples=3,
+               cm_params=None):
+    if cm_params is None:
+        cm_params = {}
     img_dir = os.path.join(output_dir, "images")
     sub_dir = os.path.join(output_dir, "subfigures")
     ann_dir = os.path.join(output_dir, "annotated")
@@ -442,16 +436,16 @@ def scan_paper(input_path, output_dir, threshold=2, block_size=64,
     os.makedirs(comp_dir, exist_ok=True)
 
     print("正在提取原始图像...")
-    dci_map = {}
     if input_path.lower().endswith('.pdf'):
-        count, dci_map = extract_images_from_pdf(input_path, img_dir, use_dci=use_dci)
+        count = extract_images_from_pdf(input_path, img_dir)
     elif input_path.lower().endswith('.xml'):
-        count, _ = extract_images_from_xml(input_path, img_dir)
+        count = extract_images_from_xml(input_path, img_dir)
     else:
         raise ValueError("仅支持 .pdf 或 .xml")
     print(f"提取到 {count} 张大图。")
 
     if count == 0:
+        print("未提取到任何图像，退出。")
         return
 
     image_files = [f for f in os.listdir(img_dir) if f.lower().endswith(('.png','.jpg','.jpeg'))]
@@ -459,22 +453,22 @@ def scan_paper(input_path, output_dir, threshold=2, block_size=64,
     subfig_bbox_map = {}  # 子图路径 -> (原图路径, (x,y,w,h))
 
     print("正在拆分子图...")
-    for img_file in image_files:
+    for idx, img_file in enumerate(image_files, 1):
         img_path = os.path.join(img_dir, img_file)
-        # 尝试获取该图像的 DCI 矩形（暂未实现像素映射，直接使用视觉分割）
         subfigs = extract_subfigures(img_path, sub_dir,
                                      min_area_ratio=min_area_ratio,
                                      border_margin=border_margin)
         for sub_path, bbox in subfigs:
             all_subfig_paths.append(sub_path)
             subfig_bbox_map[sub_path] = (img_path, bbox)
+        print(f"  图像 {idx}/{len(image_files)} 拆解出 {len(subfigs)} 个子图")
     print(f"拆解得到 {len(all_subfig_paths)} 个子图。")
 
     # 全局重复
     print(f"执行子图全局重复检测（阈值={threshold}）...")
     global_dup = find_global_duplicates_subfigs(all_subfig_paths, threshold=threshold)
 
-    # 子图级分析（支持并行）
+    # 子图级分析
     local_results = {}
     ela_noise_results = {}
     copy_move_results = {}
@@ -484,18 +478,21 @@ def scan_paper(input_path, output_dir, threshold=2, block_size=64,
         print(f"使用 {workers} 个工作进程并行分析子图...")
         with ProcessPoolExecutor(max_workers=workers) as executor:
             futures = {
-                executor.submit(process_single_subfig, p, block_size, ela_qualities, noise_std_threshold): p
+                executor.submit(process_single_subfig, p, block_size, ela_qualities,
+                                noise_std_threshold, local_eps, local_min_samples, cm_params): p
                 for p in all_subfig_paths
             }
+            completed = 0
             for future in as_completed(futures):
                 sub_path = futures[future]
+                completed += 1
+                print(f"  进度: {completed}/{len(all_subfig_paths)}", end='\r')
                 try:
                     res = future.result()
                 except Exception as e:
-                    print(f"处理子图 {sub_path} 出错: {e}")
+                    print(f"\n处理子图 {sub_path} 出错: {e}\n{traceback.format_exc()}", file=sys.stderr)
                     continue
                 base = os.path.basename(res['path'])
-                # 收集结果
                 if res['local']:
                     local_results[base] = res['local']
                 if res['ela_noise']['ela'] or res['ela_noise']['noise_inconsistency'] > 0:
@@ -516,14 +513,15 @@ def scan_paper(input_path, output_dir, threshold=2, block_size=64,
                     for dx, dy in res['copy_move']:
                         end_x = center_orig[0] + dx
                         end_y = center_orig[1] + dy
-                        # 修正：箭头标注使用正确格式
                         orig_annotations[orig_path].append(
                             ('arrow', ((center_orig[0], center_orig[1]), (end_x, end_y)), 'blue'))
+            print()
     else:
-        for sub_path in all_subfig_paths:
+        for idx, sub_path in enumerate(all_subfig_paths, 1):
             base = os.path.basename(sub_path)
-            print(f"  分析 {base} ...")
-            res = process_single_subfig(sub_path, block_size, ela_qualities, noise_std_threshold)
+            print(f"  分析 {idx}/{len(all_subfig_paths)}: {base}")
+            res = process_single_subfig(sub_path, block_size, ela_qualities,
+                                        noise_std_threshold, local_eps, local_min_samples, cm_params)
             if res['local']:
                 local_results[base] = res['local']
             if res['ela_noise']['ela'] or res['ela_noise']['noise_inconsistency'] > 0:
@@ -543,7 +541,6 @@ def scan_paper(input_path, output_dir, threshold=2, block_size=64,
                 for dx, dy in res['copy_move']:
                     end_x = center_orig[0] + dx
                     end_y = center_orig[1] + dy
-                    # 修正：箭头标注使用正确格式
                     orig_annotations[orig_path].append(
                         ('arrow', ((center_orig[0], center_orig[1]), (end_x, end_y)), 'blue'))
 
@@ -553,7 +550,6 @@ def scan_paper(input_path, output_dir, threshold=2, block_size=64,
         out_name = "annotated_" + os.path.basename(orig_path)
         out_path = os.path.join(ann_dir, out_name)
         draw_annotations_on_original(orig_path, ann_list, out_path)
-        # 生成并排对比图
         comp_path = os.path.join(comp_dir, "comparison_" + os.path.basename(orig_path))
         create_comparison(orig_path, out_path, comp_path)
 
@@ -583,9 +579,33 @@ if __name__ == "__main__":
     parser.add_argument("--min_area_ratio", type=float, default=0.02, help="子图最小面积占原图比例")
     parser.add_argument("--border_margin", type=int, default=10, help="子图边框扩展像素")
     parser.add_argument("--noise_threshold", type=float, default=50, help="噪声方差不一致性基础阈值")
-    parser.add_argument("--workers", type=int, default=1, help="并行处理子图的进程数（1为单进程）")
+    parser.add_argument("--workers", type=int, default=1, help="并行处理子图的进程数")
+    parser.add_argument("--local_eps", type=float, default=0.2, help="局部DBSCAN的eps（归一化汉明距离）")
+    parser.add_argument("--local_min_samples", type=int, default=3, help="局部DBSCAN的最小样本数")
+    parser.add_argument("--cm_min_match", type=int, default=DEFAULT_CM_MIN_MATCH)
+    parser.add_argument("--cm_eps", type=float, default=DEFAULT_CM_EPS)
+    parser.add_argument("--cm_min_samples", type=int, default=DEFAULT_CM_MIN_SAMPLES)
+    parser.add_argument("--cm_gms_radius", type=int, default=DEFAULT_GMS_RADIUS)
+    parser.add_argument("--cm_ransac_thresh", type=float, default=DEFAULT_RANSAC_THRESH)
     args = parser.parse_args()
-    scan_paper(args.input, args.output, threshold=args.threshold,
-               block_size=args.block, ela_qualities=args.ela_qualities,
-               min_area_ratio=args.min_area_ratio, border_margin=args.border_margin,
-               noise_std_threshold=args.noise_threshold, workers=args.workers)
+
+    cm_params = {
+        'min_match': args.cm_min_match,
+        'eps': args.cm_eps,
+        'min_samples': args.cm_min_samples,
+        'gms_radius': args.cm_gms_radius,
+        'ransac_thresh': args.cm_ransac_thresh,
+    }
+    scan_paper(
+        args.input, args.output,
+        threshold=args.threshold,
+        block_size=args.block,
+        ela_qualities=args.ela_qualities,
+        min_area_ratio=args.min_area_ratio,
+        border_margin=args.border_margin,
+        noise_std_threshold=args.noise_threshold,
+        workers=args.workers,
+        local_eps=args.local_eps,
+        local_min_samples=args.local_min_samples,
+        cm_params=cm_params
+    )
