@@ -41,6 +41,13 @@ DEFAULT_CM_MIN_MATCH = 15
 DEFAULT_CM_EPS = 2
 DEFAULT_CM_MIN_SAMPLES = 5
 
+# 新增：边缘Logo过滤参数
+EDGE_MARGIN = 20               # 距离边缘多少像素以内视为边缘
+EDGE_AREA_RATIO_MAX = 0.03     # 边缘区域面积占比超过此值才保留（小于则跳过）
+
+# 新增：柱状图/图表检测阈值
+LAPLACIAN_VAR_THRESH = 50      # 拉普拉斯方差低于此值视为平坦图像
+
 # ---------- 辅助函数 ----------
 def numpy_to_python(obj):
     """将 numpy 类型转换为 Python 原生类型，用于 JSON 序列化"""
@@ -132,8 +139,20 @@ def extract_subfigures(img_path, output_dir, min_area_ratio=0.02, border_margin=
     subfigures = []
     for cnt in contours:
         x, y, cw, ch = cv2.boundingRect(cnt)
-        if cw * ch < min_area:
+        area = cw * ch
+        if area < min_area:
             continue
+
+        # ---- 新增：边缘Logo/页码过滤 ----
+        # 如果轮廓紧贴图像边缘（距边缘 < EDGE_MARGIN）且面积占比 < EDGE_AREA_RATIO_MAX，
+        # 视为页眉页脚的Logo/页码等装饰元素，直接跳过
+        on_edge = (x < EDGE_MARGIN or y < EDGE_MARGIN or
+                   x + cw > w - EDGE_MARGIN or y + ch > h - EDGE_MARGIN)
+        area_ratio = area / (w * h)
+        if on_edge and area_ratio < EDGE_AREA_RATIO_MAX:
+            continue
+        # ---- 新增结束 ----
+
         x = max(0, x - border_margin)
         y = max(0, y - border_margin)
         cw = min(w - x, cw + 2 * border_margin)
@@ -192,7 +211,6 @@ def find_local_duplicates_strict(img_path, block_size=64, hash_size=DEFAULT_HASH
                 hashes.append(ph)
         if len(hashes) < 2:
             return []
-        # 修复：正确转换 ImageHash 为 numpy 数组
         hash_vectors = np.array([ph.hash.flatten().astype(np.float64) for ph in hashes])
         clustering = DBSCAN(eps=eps, min_samples=min_samples, metric='hamming').fit(hash_vectors)
         labels = clustering.labels_
@@ -315,7 +333,7 @@ def detect_copy_move_gms(img_path,
         print(f"复制-移动检测失败 {img_path}: {e}\n{traceback.format_exc()}", file=sys.stderr)
         return []
 
-# ---------- 6. ELA + 噪声分析 ----------
+# ---------- 6. ELA + 噪声分析（修复：增加柱状图/图表过滤） ----------
 def ela_and_noise_analysis(img_path, quality_list=[75, 90, 98], diff_threshold=30,
                            noise_std_threshold=50, ela_bg_correction=True,
                            noise_win_size=DEFAULT_NOISE_WIN_SIZE):
@@ -324,6 +342,17 @@ def ela_and_noise_analysis(img_path, quality_list=[75, 90, 98], diff_threshold=3
         img = safe_imread(img_path)
         if img is None:
             return results
+
+        # ---- 新增：柱状图/图表检测（低纹理平坦图像） ----
+        # 如果图像拉普拉斯方差低于阈值，说明是平坦区域（如柱状图、表格），
+        # 其ELA异常多为JPEG压缩伪影，直接返回全零，避免误报。
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        lap_var = cv2.Laplacian(gray, cv2.CV_64F).var()
+        if lap_var < LAPLACIAN_VAR_THRESH:
+            # 仅保留噪声分析（通常也为0），全部置0
+            return {"ela": {str(q): 0.0 for q in quality_list}, "noise_inconsistency": 0.0}
+        # ---- 新增结束 ----
+
         # ELA 使用内存编解码
         for q in quality_list:
             _, enc = cv2.imencode('.jpg', img, [int(cv2.IMWRITE_JPEG_QUALITY), q])
@@ -340,8 +369,8 @@ def ela_and_noise_analysis(img_path, quality_list=[75, 90, 98], diff_threshold=3
                 _, high_diff = cv2.threshold(diff_equalized, diff_threshold, 255, cv2.THRESH_BINARY)
             abnormal_ratio = np.sum(high_diff > 0) / diff_equalized.size * 100
             results["ela"][q] = round(abnormal_ratio, 2) if abnormal_ratio > 1.0 else 0.0
+
         # 噪声方差
-        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
         lap = cv2.Laplacian(gray, cv2.CV_64F)
         win_size = noise_win_size
         mean_lap = cv2.boxFilter(lap, -1, (win_size, win_size), normalize=True)
@@ -351,6 +380,7 @@ def ela_and_noise_analysis(img_path, quality_list=[75, 90, 98], diff_threshold=3
         global_noise_level = np.median(var_map)
         adaptive_thresh = max(noise_std_threshold, global_noise_level * 3)
         results["noise_inconsistency"] = round(var_std, 2) if var_std > adaptive_thresh else 0.0
+
         return results
     except Exception as e:
         print(f"ELA/噪声分析失败 {img_path}: {e}\n{traceback.format_exc()}", file=sys.stderr)
@@ -621,5 +651,5 @@ if __name__ == "__main__":
         local_eps=args.local_eps,
         local_min_samples=args.local_min_samples,
         cm_params=cm_params,
-        ela_bg_correction=True  # 如需可通过命令行添加
+        ela_bg_correction=True
     )
