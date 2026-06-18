@@ -30,7 +30,6 @@ from sklearn.cluster import DBSCAN
 
 # ---------- 全局常量（可调参数） ----------
 DEFAULT_HASH_SIZE = 8
-DEFAULT_OTSU_BLOCK = 5          # 形态学闭运算核大小
 DEFAULT_ELA_DIFF_THRESHOLD = 30
 DEFAULT_NOISE_WIN_SIZE = 15
 DEFAULT_RANSAC_THRESH = 5.0
@@ -43,6 +42,19 @@ DEFAULT_CM_EPS = 2
 DEFAULT_CM_MIN_SAMPLES = 5
 
 # ---------- 辅助函数 ----------
+def numpy_to_python(obj):
+    """将 numpy 类型转换为 Python 原生类型，用于 JSON 序列化"""
+    if isinstance(obj, np.integer):
+        return int(obj)
+    elif isinstance(obj, np.floating):
+        return float(obj)
+    elif isinstance(obj, np.ndarray):
+        return obj.tolist()
+    elif isinstance(obj, np.bool_):
+        return bool(obj)
+    else:
+        raise TypeError(f"Object of type {type(obj)} is not JSON serializable")
+
 def compute_phash(img_path, hash_size=DEFAULT_HASH_SIZE):
     try:
         return imagehash.phash(Image.open(img_path), hash_size=hash_size)
@@ -180,7 +192,8 @@ def find_local_duplicates_strict(img_path, block_size=64, hash_size=DEFAULT_HASH
                 hashes.append(ph)
         if len(hashes) < 2:
             return []
-        hash_vectors = np.array([np.array(h, dtype=np.float64).flatten() for h in hashes])
+        # 修复：正确转换 ImageHash 为 numpy 数组
+        hash_vectors = np.array([ph.hash.flatten().astype(np.float64) for ph in hashes])
         clustering = DBSCAN(eps=eps, min_samples=min_samples, metric='hamming').fit(hash_vectors)
         labels = clustering.labels_
         dynamic_max_area_ratio = max(0.03, min(dynamic_area_max, 20000.0 / (w * h)))
@@ -423,7 +436,7 @@ def scan_paper(input_path, output_dir, threshold=2, block_size=64,
                ela_qualities=[75,90,98], min_area_ratio=0.02, border_margin=10,
                noise_std_threshold=50, workers=1,
                local_eps=0.2, local_min_samples=3,
-               cm_params=None):
+               cm_params=None, ela_bg_correction=True):
     if cm_params is None:
         cm_params = {}
     img_dir = os.path.join(output_dir, "images")
@@ -563,7 +576,7 @@ def scan_paper(input_path, output_dir, threshold=2, block_size=64,
     }
     report_path = os.path.join(output_dir, "report.json")
     with open(report_path, 'w', encoding='utf-8') as f:
-        json.dump(report, f, indent=2, ensure_ascii=False)
+        json.dump(report, f, indent=2, ensure_ascii=False, default=numpy_to_python)
     print(f"扫描完成！报告已保存至 {report_path}")
     print(f"标注图像: {ann_dir}\n对比图像: {comp_dir}")
 
@@ -607,5 +620,6 @@ if __name__ == "__main__":
         workers=args.workers,
         local_eps=args.local_eps,
         local_min_samples=args.local_min_samples,
-        cm_params=cm_params
+        cm_params=cm_params,
+        ela_bg_correction=True  # 如需可通过命令行添加
     )
